@@ -24,10 +24,10 @@ module {
         %c0 = arith.constant 0 : index
 
         // In this example, A is distributed across HBM and two LX scratchpads; B is on HBM
-        %A_HBM_addr = arith.constant 0       : index
-        %A_LX0_addr = arith.constant 12288   : index
-        %A_LX1_addr = arith.constant 16384   : index
-        %B_addr     = arith.constant 24576   : index
+        %A_HBM_addr = arith.constant 0       : index   // byte 0 / 2 (f16) = 0
+        %A_LX0_addr = arith.constant 6144    : index   // byte 12288 / 2 (f16) = 6144
+        %A_LX1_addr = arith.constant 8192    : index   // byte 16384 / 2 (f16) = 8192
+        %B_addr     = arith.constant 12288   : index   // byte 24576 / 2 (f16) = 12288
 
         // Accessing a tensor in KTIR follows a 3 step process:
         // Note1: Accesses are single-ended i.e.,

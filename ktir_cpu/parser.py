@@ -106,8 +106,14 @@ class KTIRParser(KTIRParserBase):
 
         # Find each func.func declaration and extract the body using
         # brace counting, which correctly skips the attributes { ... } block.
-        for match in re.finditer(r'func\.func\s+@(\w+)\s*\(([^)]*)\)', mlir_text):
-            func_name = match.group(1)
+        # Accept both bare identifiers (@name) and MLIR's quoted form
+        # (@"name-with-dashes") for names that contain characters outside
+        # \w.
+        for match in re.finditer(
+            r'func\.func\s+@(?:"([^"]+)"|(\w+))\s*\(([^)]*)\)',
+            mlir_text,
+        ):
+            func_name = match.group(1) or match.group(2)
             func_header_end = match.end()
 
             # Extract the full header up to the body-opening brace.

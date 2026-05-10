@@ -154,8 +154,8 @@ def test_tensor_extract_slice():
 module {
   func.func @extract_slice_kernel() attributes {grid = [1, 1]} {
     %c0 = arith.constant 0 : index
-    %src = arith.constant 0 : index
-    %dst = arith.constant 256 : index
+    %src = arith.constant 0 : index       // byte 0   / 2 (f16) = 0
+    %dst = arith.constant 128 : index     // byte 256 / 2 (f16) = 128
     %src_view = ktdp.construct_memory_view %src, sizes: [8, 8], strides: [8, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
         memory_space = #ktdp.spyre_memory_space<HBM>

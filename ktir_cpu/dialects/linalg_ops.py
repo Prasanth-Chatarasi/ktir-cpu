@@ -152,6 +152,30 @@ def linalg__matmul(op, context, env):
     return result
 
 
+@register("linalg.batch_matmul", latency_category=LC.COMPUTE_MATMUL)
+def linalg__batch_matmul(op, context, env):
+    """Batched matmul: result[b,m,n] = outs[b,m,n] + sum_k A[b,m,k] * B[b,k,n].
+
+    Matches linalg.matmul's accumulate-into-outs convention so a zero outs
+    buffer gives a plain batch matmul, and a non-zero outs buffer lets the
+    translator chain accumulations.
+    """
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    out_tile = context.get_value(op.operands[2])
+    if not isinstance(a, Tile) or not isinstance(b, Tile) or not isinstance(out_tile, Tile):
+        raise TypeError("linalg.batch_matmul: expected three Tile operands")
+    # Promote to float32 for the contraction to avoid catastrophic f16 rounding
+    # on larger K, then cast back to outs dtype.
+    product = np.einsum(
+        "bmk,bkn->bmn",
+        a.data.astype(np.float32),
+        b.data.astype(np.float32),
+    )
+    result = (out_tile.data.astype(np.float32) + product).astype(out_tile.data.dtype)
+    return Tile(result, out_tile.dtype, out_tile.shape)
+
+
 @register("linalg.generic", latency_category=LC.COMPUTE_FLOAT)
 def linalg__generic(op, context, env):
     """Vectorised linalg.generic executor.
@@ -194,9 +218,32 @@ def linalg__generic(op, context, env):
     context.set_value("__linalg_shape__", out_shape)
 
     # Broadcast each input to the iteration space and bind to its bb0 arg.
+    #
+    # Each indexing_map entry can be either:
+    #   - a flat list of ints         (dim-only, e.g. [0, 2, 3])
+    #   - a list of (kind, value)     (mixed, e.g. [('dim',0),('dim',2),('const',0)])
+    # Constant positions collapse the corresponding source axis at the
+    # given index; dim positions map a source axis onto an iteration dim.
     for i, (val, imap) in enumerate(zip(ins_vals, indexing_maps[:n_ins])):
         if isinstance(val, Tile):
             data = val.data
+            # Normalise: mixed → apply constant slices left-to-right, leaving
+            # only dim positions (now shorter than original by len(consts)).
+            if imap and isinstance(imap[0], tuple):
+                dim_positions = []
+                # Walk source axes in order; slice at const positions, keep
+                # dim positions for the expand/broadcast loop below.
+                axis = 0
+                for kind, value in imap:
+                    if kind == 'const':
+                        # Collapse source axis `axis` at index `value`.
+                        data = np.take(data, value, axis=axis)
+                        # Don't advance axis — numpy.take drops the sliced
+                        # axis, so the next position indexes the same slot.
+                    else:  # 'dim'
+                        dim_positions.append(value)
+                        axis += 1
+                imap = dim_positions
             for d in range(out_ndim):
                 if d not in imap:
                     data = np.expand_dims(data, axis=d)
@@ -254,6 +301,85 @@ def linalg__transpose(op, context, env):
     transposed = np.transpose(inp.data, axes=permutation)
     new_shape = tuple(inp.shape[i] for i in permutation)
     return Tile(transposed.copy(), inp.dtype, new_shape)
+
+
+# ---------------------------------------------------------------------------
+# Named elementwise ops (binary)
+# ---------------------------------------------------------------------------
+#
+# MLIR semantics: result[i] = op(A[i], B[i]).  The outs operand provides
+# shape/dtype only — it does NOT initialise the result like linalg.matmul.
+
+def _linalg_elementwise_binary(op, context, env, np_fn):
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    out_tile = context.get_value(op.operands[2])
+    if not isinstance(a, Tile) or not isinstance(b, Tile):
+        raise TypeError(f"{op.op_type}: expected Tile ins, got {type(a)}, {type(b)}")
+    if not isinstance(out_tile, Tile):
+        raise TypeError(f"{op.op_type}: expected Tile outs, got {type(out_tile)}")
+    result = np_fn(a.data, b.data).astype(out_tile.data.dtype)
+    return Tile(result, out_tile.dtype, out_tile.shape)
+
+
+@register("linalg.add", latency_category=LC.COMPUTE_FLOAT)
+def linalg__add(op, context, env):
+    return _linalg_elementwise_binary(op, context, env, np.add)
+
+
+@register("linalg.sub", latency_category=LC.COMPUTE_FLOAT)
+def linalg__sub(op, context, env):
+    return _linalg_elementwise_binary(op, context, env, np.subtract)
+
+
+@register("linalg.mul", latency_category=LC.COMPUTE_FLOAT)
+def linalg__mul(op, context, env):
+    return _linalg_elementwise_binary(op, context, env, np.multiply)
+
+
+@register("linalg.div", latency_category=LC.COMPUTE_FLOAT)
+def linalg__div(op, context, env):
+    return _linalg_elementwise_binary(op, context, env, np.divide)
+
+
+@register("linalg.max", latency_category=LC.COMPUTE_FLOAT)
+def linalg__max(op, context, env):
+    return _linalg_elementwise_binary(op, context, env, np.maximum)
+
+
+# ---------------------------------------------------------------------------
+# Named elementwise ops (unary)
+# ---------------------------------------------------------------------------
+
+def _linalg_elementwise_unary(op, context, env, np_fn):
+    a = context.get_value(op.operands[0])
+    out_tile = context.get_value(op.operands[1])
+    if not isinstance(a, Tile):
+        raise TypeError(f"{op.op_type}: expected Tile ins, got {type(a)}")
+    if not isinstance(out_tile, Tile):
+        raise TypeError(f"{op.op_type}: expected Tile outs, got {type(out_tile)}")
+    result = np_fn(a.data).astype(out_tile.data.dtype)
+    return Tile(result, out_tile.dtype, out_tile.shape)
+
+
+@register("linalg.negf", latency_category=LC.COMPUTE_FLOAT)
+def linalg__negf(op, context, env):
+    return _linalg_elementwise_unary(op, context, env, np.negative)
+
+
+@register("linalg.abs", latency_category=LC.COMPUTE_FLOAT)
+def linalg__abs(op, context, env):
+    return _linalg_elementwise_unary(op, context, env, np.abs)
+
+
+@register("linalg.exp", latency_category=LC.COMPUTE_FLOAT)
+def linalg__exp(op, context, env):
+    return _linalg_elementwise_unary(op, context, env, np.exp)
+
+
+@register("linalg.log", latency_category=LC.COMPUTE_FLOAT)
+def linalg__log(op, context, env):
+    return _linalg_elementwise_unary(op, context, env, np.log)
 
 
 # ---------------------------------------------------------------------------
@@ -384,15 +510,29 @@ def parse_linalg_generic(op_text, parse_ctx):
         return None
     result_name = result_match.group(1)
 
-    # indexing_maps = [affine_map<(d0, d1) -> (d0)>, ...]
+    # indexing_maps = [affine_map<(d0, d1) -> (d0)>, ...] or [#map0, #map1, ...]
+    # where #name references are module-level aliases resolved via parse_ctx.
+    #
+    # Each map's result list can mix dim refs and integer constants, e.g.
+    # `(d0, d1, d2, d3, d4) -> (d0, d2, d3, 0)` — the constant selects a
+    # fixed index on one source axis, collapsing it. The handler needs to
+    # know which positions are dims vs constants, so we preserve the full
+    # expression list. Dim-only maps keep the legacy flat-int format to
+    # stay compatible with existing tests.
     maps = []
     maps_match = re.search(r'indexing_maps\s*=\s*', op_text)
     if maps_match:
         raw_maps = parse_attr_list(op_text[maps_match.end() - 1:])
+        aliases = getattr(parse_ctx, "aliases", {}) or {}
         for raw in raw_maps:
+            raw = raw.strip()
+            if raw.startswith("#") and raw in aliases:
+                raw = aliases[raw]
             amap = parse_affine_map(raw)
-            dims = [e[1] for e in amap.exprs if e[0] == 'dim']
-            maps.append(dims)
+            if all(e[0] == 'dim' for e in amap.exprs):
+                maps.append([e[1] for e in amap.exprs])
+            else:
+                maps.append(list(amap.exprs))
 
     ins_operands = []
     ins_match = re.search(r'\bins\s*\(([^)]+)\)', op_text)
@@ -473,4 +613,66 @@ def parse_linalg_broadcast(op_text, parse_ctx):
         operands=operands,
         attributes={"dimensions": dims},
         result_type="unknown"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parsers for named elementwise ops and batch_matmul
+# ---------------------------------------------------------------------------
+
+_LINALG_ELEMENTWISE_NAMES = (
+    "linalg.add", "linalg.sub", "linalg.mul", "linalg.div", "linalg.max",
+    "linalg.negf", "linalg.abs", "linalg.exp", "linalg.log",
+)
+
+
+@register_parser(*_LINALG_ELEMENTWISE_NAMES)
+def parse_linalg_elementwise(op_text, parse_ctx):
+    """Parse named elementwise linalg ops with ins(...) outs(...) form."""
+    name_match = re.match(r'(%\w+)\s*=\s*(linalg\.\w+)\s+', op_text)
+    if not name_match:
+        return None
+    result_name = name_match.group(1)
+    op_type = name_match.group(2)
+    if op_type not in _LINALG_ELEMENTWISE_NAMES:
+        return None
+
+    ins_match = re.search(r'ins\(([^)]+)\)', op_text)
+    outs_match = re.search(r'outs\(([^)]+)\)', op_text)
+    if not ins_match or not outs_match:
+        return None
+
+    operands = re.findall(r'%\w+', ins_match.group(1))
+    operands += re.findall(r'%\w+', outs_match.group(1))
+
+    return Operation(
+        result=result_name,
+        op_type=op_type,
+        operands=operands,
+        attributes={},
+        result_type="unknown",
+    )
+
+
+@register_parser("linalg.batch_matmul")
+def parse_linalg_batch_matmul(op_text, parse_ctx):
+    """Parse linalg.batch_matmul ins(%a, %b : ...) outs(%c : ...) -> ..."""
+    result_match = re.match(r'(%\w+)\s*=\s*linalg\.batch_matmul\s+', op_text)
+    if not result_match:
+        return None
+
+    ins_match = re.search(r'ins\(([^)]+)\)', op_text)
+    outs_match = re.search(r'outs\(([^)]+)\)', op_text)
+    if not ins_match or not outs_match:
+        return None
+
+    operands = re.findall(r'%\w+', ins_match.group(1))
+    operands += re.findall(r'%\w+', outs_match.group(1))
+
+    return Operation(
+        result=result_match.group(1),
+        op_type="linalg.batch_matmul",
+        operands=operands,
+        attributes={},
+        result_type="unknown",
     )

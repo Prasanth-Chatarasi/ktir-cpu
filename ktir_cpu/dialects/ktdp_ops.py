@@ -12,15 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""KTDP dialect handlers — grid, memory view, access tile, load/store."""
+"""KTDP dialect handlers — grid, memory view, access tile, load/store.
+
+Pointer operands to ``ktdp.construct_memory_view`` are interpreted as
+element offsets (scaled by the memref's element size inside the
+handler).  ``TileRef.base_ptr`` and all downstream ops remain
+byte-addressed.
+"""
 
 import re
 
 from .ktdp_helpers import parse_subscript_expr
+from ..dtypes import bytes_per_elem
 from ..ir_types import AccessTile, IndirectAccessTile, Operation, Tile
 from ..latency import LatencyCategory as LC
-from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
+from ..ops.grid_ops import GridOps
 from ..parser_ast import parse_affine_map, parse_affine_set
 from ..parser_utils import _extract_bracket_content, parse_attr_block, split_top_level
 from .registry import ParseContext, register, register_parser
@@ -42,6 +49,13 @@ def ktdp__coreid(op, context, env):
 
 @register("ktdp.construct_memory_view")
 def ktdp__construct_memory_view(op, context, env):
+    """Construct a memory view.
+
+    The pointer operand is an ELEMENT offset relative to the memref's
+    element type. It is converted to a byte offset here — every
+    downstream consumer (construct_access_tile, load, store,
+    construct_indirect_access_tile) operates on TileRef.base_ptr in bytes.
+    """
     if not op.operands:
         raise ValueError("construct_memory_view: missing pointer operand")
     ptr = context.get_value(op.operands[0])
@@ -54,7 +68,8 @@ def ktdp__construct_memory_view(op, context, env):
     memory_space = op.attributes["memory_space"]
     dtype = op.attributes["dtype"]
     coordinate_set = op.attributes.get("coordinate_set")
-    return MemoryOps.tile_view(context, ptr, shape, strides, memory_space, dtype, coordinate_set)
+    byte_ptr = int(ptr) * bytes_per_elem(dtype)
+    return MemoryOps.tile_view(context, byte_ptr, shape, strides, memory_space, dtype, coordinate_set)
 
 
 @register("ktdp.construct_access_tile")

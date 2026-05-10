@@ -283,6 +283,26 @@ class TestArithParsers(ParseTestMixin):
         self.assert_operand_names(op, "%i")
         self.assert_result_type(op, "f16")
 
+    def test_fptosi(self):
+        # fptosi records operand and target int type
+        op = self._parse(
+            "%i = arith.fptosi %f : f16 to i32",
+            args={"%f": "f16"},
+        )
+        self.assert_op_type(op, "arith.fptosi")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%f")
+
+    def test_trunci(self):
+        op = self._parse(
+            "%r = arith.trunci %x : i64 to i32",
+            args={"%x": "i64"},
+        )
+        self.assert_op_type(op, "arith.trunci")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%x")
+        self.assert_attribute(op, "dst_type", "i32")
+
     def test_cmpf_olt(self):
         op = self._parse(
             "%r = arith.cmpf olt, %a, %b : f16",
@@ -361,6 +381,96 @@ class TestLinalgParsers(ParseTestMixin):
         self.assert_num_operands(op, 2)
         self.assert_operand_names(op, "%x", "%buf")
 
+    def test_linalg_add(self):
+        op = self._parse(
+            "%r = linalg.add ins(%a, %b : tensor<2x2xf16>, tensor<2x2xf16>) "
+            "outs(%c : tensor<2x2xf16>) -> tensor<2x2xf16>",
+            args={"%a": "tensor<2x2xf16>", "%b": "tensor<2x2xf16>", "%c": "tensor<2x2xf16>"},
+        )
+        self.assert_op_type(op, "linalg.add")
+        self.assert_num_operands(op, 3)
+
+    def test_linalg_sub(self):
+        op = self._parse(
+            "%r = linalg.sub ins(%a, %b : tensor<2xf16>, tensor<2xf16>) "
+            "outs(%c : tensor<2xf16>) -> tensor<2xf16>",
+            args={"%a": "tensor<2xf16>", "%b": "tensor<2xf16>", "%c": "tensor<2xf16>"},
+        )
+        self.assert_op_type(op, "linalg.sub")
+        self.assert_num_operands(op, 3)
+
+    def test_linalg_mul(self):
+        op = self._parse(
+            "%r = linalg.mul ins(%a, %b : tensor<4xf16>, tensor<4xf16>) "
+            "outs(%c : tensor<4xf16>) -> tensor<4xf16>",
+            args={"%a": "tensor<4xf16>", "%b": "tensor<4xf16>", "%c": "tensor<4xf16>"},
+        )
+        self.assert_op_type(op, "linalg.mul")
+        self.assert_num_operands(op, 3)
+
+    def test_linalg_div(self):
+        op = self._parse(
+            "%r = linalg.div ins(%a, %b : tensor<4xf16>, tensor<4xf16>) "
+            "outs(%c : tensor<4xf16>) -> tensor<4xf16>",
+            args={"%a": "tensor<4xf16>", "%b": "tensor<4xf16>", "%c": "tensor<4xf16>"},
+        )
+        self.assert_op_type(op, "linalg.div")
+        self.assert_num_operands(op, 3)
+
+    def test_linalg_max(self):
+        op = self._parse(
+            "%r = linalg.max ins(%a, %b : tensor<4xf16>, tensor<4xf16>) "
+            "outs(%c : tensor<4xf16>) -> tensor<4xf16>",
+            args={"%a": "tensor<4xf16>", "%b": "tensor<4xf16>", "%c": "tensor<4xf16>"},
+        )
+        self.assert_op_type(op, "linalg.max")
+        self.assert_num_operands(op, 3)
+
+    def test_linalg_negf_unary(self):
+        op = self._parse(
+            "%r = linalg.negf ins(%a : tensor<4xf16>) "
+            "outs(%c : tensor<4xf16>) -> tensor<4xf16>",
+            args={"%a": "tensor<4xf16>", "%c": "tensor<4xf16>"},
+        )
+        self.assert_op_type(op, "linalg.negf")
+        self.assert_num_operands(op, 2)
+
+    def test_linalg_abs(self):
+        op = self._parse(
+            "%r = linalg.abs ins(%a : tensor<4xf16>) "
+            "outs(%c : tensor<4xf16>) -> tensor<4xf16>",
+            args={"%a": "tensor<4xf16>", "%c": "tensor<4xf16>"},
+        )
+        self.assert_op_type(op, "linalg.abs")
+        self.assert_num_operands(op, 2)
+
+    def test_linalg_exp(self):
+        op = self._parse(
+            "%r = linalg.exp ins(%a : tensor<4xf16>) "
+            "outs(%c : tensor<4xf16>) -> tensor<4xf16>",
+            args={"%a": "tensor<4xf16>", "%c": "tensor<4xf16>"},
+        )
+        self.assert_op_type(op, "linalg.exp")
+        self.assert_num_operands(op, 2)
+
+    def test_linalg_log(self):
+        op = self._parse(
+            "%r = linalg.log ins(%a : tensor<4xf16>) "
+            "outs(%c : tensor<4xf16>) -> tensor<4xf16>",
+            args={"%a": "tensor<4xf16>", "%c": "tensor<4xf16>"},
+        )
+        self.assert_op_type(op, "linalg.log")
+        self.assert_num_operands(op, 2)
+
+    def test_linalg_batch_matmul(self):
+        op = self._parse(
+            "%r = linalg.batch_matmul ins(%a, %b : tensor<2x2x3xf16>, tensor<2x3x2xf16>) "
+            "outs(%c : tensor<2x2x2xf16>) -> tensor<2x2x2xf16>",
+            args={"%a": "tensor<2x2x3xf16>", "%b": "tensor<2x3x2xf16>", "%c": "tensor<2x2x2xf16>"},
+        )
+        self.assert_op_type(op, "linalg.batch_matmul")
+        self.assert_num_operands(op, 3)
+
 
 # ---------------------------------------------------------------------------
 # tensor dialect parsers
@@ -436,6 +546,67 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_num_operands(yield_op, 1)
         self.assert_operand_names(yield_op, "%val")
         assert yield_op.result is None
+
+
+# ---------------------------------------------------------------------------
+# tensor.extract_slice / tensor.insert_slice parsers
+# ---------------------------------------------------------------------------
+
+class TestTensorSliceParsers(ParseTestMixin):
+    def test_extract_slice_rank_preserving(self):
+        op = self._parse(
+            "%r = tensor.extract_slice %a[1, 0] [2, 3] [1, 1] : "
+            "tensor<4x4xf16> to tensor<2x3xf16>",
+            args={"%a": "tensor<4x4xf16>"},
+        )
+        self.assert_op_type(op, "tensor.extract_slice")
+        self.assert_num_operands(op, 1)
+        self.assert_attribute(op, "offsets", [1, 0])
+        self.assert_attribute(op, "sizes", [2, 3])
+        self.assert_attribute(op, "strides", [1, 1])
+        self.assert_attribute(op, "input_shape", (4, 4))
+        self.assert_attribute(op, "result_shape", (2, 3))
+
+    def test_extract_slice_rank_reducing(self):
+        op = self._parse(
+            "%r = tensor.extract_slice %a[0, 0, 0, 0] [12, 1, 64, 1] "
+            "[1, 1, 1, 1] : tensor<12x1x64x64xf16> to tensor<12x1x64xf16>",
+            args={"%a": "tensor<12x1x64x64xf16>"},
+        )
+        self.assert_op_type(op, "tensor.extract_slice")
+        self.assert_num_operands(op, 1)
+        self.assert_attribute(op, "offsets", [0, 0, 0, 0])
+        self.assert_attribute(op, "sizes", [12, 1, 64, 1])
+        self.assert_attribute(op, "strides", [1, 1, 1, 1])
+        self.assert_attribute(op, "input_shape", (12, 1, 64, 64))
+        self.assert_attribute(op, "result_shape", (12, 1, 64))
+
+    def test_insert_slice_basic(self):
+        op = self._parse(
+            "%r = tensor.insert_slice %s into %d[1, 0] [2, 3] [1, 1] : "
+            "tensor<2x3xf16> into tensor<4x4xf16>",
+            args={"%s": "tensor<2x3xf16>", "%d": "tensor<4x4xf16>"},
+        )
+        self.assert_op_type(op, "tensor.insert_slice")
+        self.assert_num_operands(op, 2)
+        self.assert_attribute(op, "offsets", [1, 0])
+        self.assert_attribute(op, "sizes", [2, 3])
+        self.assert_attribute(op, "strides", [1, 1])
+        self.assert_attribute(op, "source_shape", (2, 3))
+        self.assert_attribute(op, "dest_shape", (4, 4))
+
+    def test_insert_slice_rank_reducing(self):
+        op = self._parse(
+            "%r = tensor.insert_slice %s into %d[0, 0, 0, 0] "
+            "[12, 1, 64, 1] [1, 1, 1, 1] : "
+            "tensor<12x1x64xf16> into tensor<12x1x64x64xf16>",
+            args={"%s": "tensor<12x1x64xf16>", "%d": "tensor<12x1x64x64xf16>"},
+        )
+        self.assert_op_type(op, "tensor.insert_slice")
+        self.assert_num_operands(op, 2)
+        self.assert_attribute(op, "source_shape", (12, 1, 64))
+        self.assert_attribute(op, "dest_shape", (12, 1, 64, 64))
+        self.assert_attribute(op, "sizes", [12, 1, 64, 1])
 
 
 # ---------------------------------------------------------------------------

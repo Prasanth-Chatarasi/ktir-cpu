@@ -120,6 +120,60 @@ def tensor__collapse_shape(op, context, env):
     return src
 
 
+@register("tensor.extract_slice")
+def tensor__extract_slice(op, context, env):
+    """Extract a sub-tensor at static offsets/sizes/strides.
+
+    Only strides == 1 supported (checked at runtime). If the declared
+    result shape has lower rank than the sliced shape, the handler
+    reshapes to the result shape — MLIR guarantees the dropped dims
+    have size 1, so the reshape preserves layout.
+    """
+    src = context.get_value(op.operands[0])
+    offsets = op.attributes["offsets"]
+    sizes = op.attributes["sizes"]
+    strides = op.attributes["strides"]
+    if any(t != 1 for t in strides):
+        raise NotImplementedError(
+            f"tensor.extract_slice: strides={strides} (only strides=1 supported)"
+        )
+    slices = tuple(slice(o, o + s) for o, s in zip(offsets, sizes))
+    data = src.data[slices]
+    result_shape = tuple(op.attributes["result_shape"])
+    if data.shape != result_shape:
+        # Rank-reducing form: size-1 dims are dropped in the declared result.
+        data = data.reshape(result_shape)
+    return Tile(data.copy(), src.dtype, result_shape)
+
+
+@register("tensor.insert_slice")
+def tensor__insert_slice(op, context, env):
+    """Write a sub-tensor into a destination at static offsets/sizes/strides.
+
+    Functional: returns a new Tile; the input dest is not mutated.
+    Only strides == 1 supported. If the source has lower rank than
+    the dest, reshape source to the sizes list before the write
+    (MLIR guarantees the missing dims correspond to size-1 entries in
+    the sizes list).
+    """
+    source = context.get_value(op.operands[0])
+    dest = context.get_value(op.operands[1])
+    offsets = op.attributes["offsets"]
+    sizes = op.attributes["sizes"]
+    strides = op.attributes["strides"]
+    if any(t != 1 for t in strides):
+        raise NotImplementedError(
+            f"tensor.insert_slice: strides={strides} (only strides=1 supported)"
+        )
+    result = dest.data.copy()
+    src_data = source.data
+    if src_data.ndim < result.ndim:
+        src_data = src_data.reshape(tuple(sizes))
+    slices = tuple(slice(o, o + s) for o, s in zip(offsets, sizes))
+    result[slices] = src_data
+    return Tile(result, dest.dtype, dest.shape)
+
+
 @register("tensor.yield")
 def tensor__yield(op, context, env):
     """Yield a value from a tensor.generate body — same semantics as scf.yield."""
@@ -249,7 +303,7 @@ def parse_tensor_splat(op_text, parse_ctx):
     )
 
 
-@register_parser("tensor.extract")
+@register_parser("tensor.extract ")
 def parse_tensor_extract(op_text, parse_ctx):
     # %scalar = tensor.extract %tensor[%i0, %i1] : tensor<...>
     result_match = re.match(r'(%\w+)\s*=\s*tensor\.extract\s+(%\w+)', op_text)
@@ -404,3 +458,127 @@ def parse_tensor_expand_shape(op_text, parse_ctx):
 @register_parser("tensor.collapse_shape")
 def parse_tensor_collapse_shape(op_text, parse_ctx):
     return _parse_reshape_op(op_text, "collapse_shape")
+
+
+# ---------------------------------------------------------------------------
+# Slice op parsers
+# ---------------------------------------------------------------------------
+
+def _parse_slice_lists(op_text):
+    """Return (offsets, sizes, strides) from the three bracketed lists
+    that follow the operand(s) in an extract/insert_slice op.
+
+    Example input fragment:
+        ...[1, 0] [2, 3] [1, 1] : tensor<...> ...
+
+    Requires all three lists to contain integer literals. A non-integer
+    token raises ValueError (dynamic SSA operands not supported in this
+    implementation).
+    """
+    # Isolate the text up to the `:` type annotation so we don't
+    # accidentally match brackets inside tensor<...> types.
+    head = op_text.split(":", 1)[0]
+    list_matches = re.findall(r'\[([^\]]*)\]', head)
+    if len(list_matches) < 3:
+        raise ValueError(
+            f"slice op: expected three bracketed lists, got {len(list_matches)}"
+        )
+    def _ints(s):
+        s = s.strip()
+        if not s:
+            return []
+        out = []
+        for tok in s.split(","):
+            tok = tok.strip()
+            try:
+                out.append(int(tok))
+            except ValueError as e:
+                raise ValueError(
+                    f"slice op: non-integer token {tok!r} — dynamic "
+                    f"offsets/sizes/strides are not supported"
+                ) from e
+        return out
+    return _ints(list_matches[0]), _ints(list_matches[1]), _ints(list_matches[2])
+
+
+@register_parser("tensor.extract_slice")
+def parse_tensor_extract_slice(op_text, parse_ctx):
+    """Parse '%r = tensor.extract_slice %src[O][S][T] : <IN> to <OUT>'."""
+    from ..parser_utils import parse_tensor_type
+
+    m = re.match(r'(%\w+)\s*=\s*tensor\.extract_slice\s+(%\w+)', op_text)
+    if not m:
+        return None
+    result_name = m.group(1)
+    source = m.group(2)
+
+    offsets, sizes, strides = _parse_slice_lists(op_text)
+
+    # Parse input and result tensor types: `: tensor<IN> to tensor<OUT>`
+    type_match = re.search(
+        r':\s*(tensor<[^>]+>)\s+to\s+(tensor<[^>]+>)', op_text
+    )
+    if not type_match:
+        raise ValueError(f"tensor.extract_slice: missing ': <IN> to <OUT>' in {op_text!r}")
+    in_info = parse_tensor_type(type_match.group(1))
+    out_info = parse_tensor_type(type_match.group(2))
+    if in_info is None or out_info is None:
+        raise ValueError(f"tensor.extract_slice: could not parse tensor types in {op_text!r}")
+
+    attributes = {
+        "offsets": offsets,
+        "sizes": sizes,
+        "strides": strides,
+        "input_shape": in_info["shape"],
+        "result_shape": out_info["shape"],
+    }
+    return Operation(
+        result=result_name,
+        op_type="tensor.extract_slice",
+        operands=[source],
+        attributes=attributes,
+        result_type=type_match.group(2),
+    )
+
+
+@register_parser("tensor.insert_slice")
+def parse_tensor_insert_slice(op_text, parse_ctx):
+    """Parse '%r = tensor.insert_slice %source into %dest[O][S][T] : <SRC> into <DEST>'."""
+    from ..parser_utils import parse_tensor_type
+
+    m = re.match(
+        r'(%\w+)\s*=\s*tensor\.insert_slice\s+(%\w+)\s+into\s+(%\w+)',
+        op_text,
+    )
+    if not m:
+        return None
+    result_name = m.group(1)
+    source = m.group(2)
+    dest = m.group(3)
+
+    offsets, sizes, strides = _parse_slice_lists(op_text)
+
+    type_match = re.search(
+        r':\s*(tensor<[^>]+>)\s+into\s+(tensor<[^>]+>)', op_text
+    )
+    if not type_match:
+        raise ValueError(f"tensor.insert_slice: missing ': <SRC> into <DEST>' in {op_text!r}")
+    src_info = parse_tensor_type(type_match.group(1))
+    dest_info = parse_tensor_type(type_match.group(2))
+    if src_info is None or dest_info is None:
+        raise ValueError(f"tensor.insert_slice: could not parse tensor types in {op_text!r}")
+
+    attributes = {
+        "offsets": offsets,
+        "sizes": sizes,
+        "strides": strides,
+        "source_shape": src_info["shape"],
+        "dest_shape": dest_info["shape"],
+    }
+    return Operation(
+        result=result_name,
+        op_type="tensor.insert_slice",
+        operands=[source, dest],
+        attributes=attributes,
+        result_type=type_match.group(2),
+    )

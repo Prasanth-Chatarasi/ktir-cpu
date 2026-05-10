@@ -663,7 +663,10 @@ class TestIndirectAccessLatency:
             hbm = interp.memory.hbm
             for name, info in sizes.items():
                 n_elements = int(np.prod(info["shape"]))
-                hbm.write(_addr_map[name], np.zeros(n_elements, dtype=_dtype_map[info["dtype"]]))
+                np_dtype = _dtype_map[info["dtype"]]
+                # Kernel constants are element-addressed; hbm.write needs bytes.
+                byte_addr = _addr_map[name] * np.dtype(np_dtype).itemsize
+                hbm.write(byte_addr, np.zeros(n_elements, dtype=np_dtype))
         interp._prepare_execution = _prepare_and_seed
 
         interp.execute_function(func_name)

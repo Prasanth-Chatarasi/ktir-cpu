@@ -190,6 +190,17 @@ def arith__minnumf(op, context, env):
     return ArithOps.minnumf(tile1, tile2)
 
 
+@register("arith.negf", latency_category=LC.COMPUTE_FLOAT)
+def arith__negf(op, context, env):
+    val = context.get_value(op.operands[0])
+    if isinstance(val, Tile):
+        return Tile(-val.data, val.dtype, val.shape)
+    # Scalar — preserve float16 when input is float16
+    if isinstance(val, (np.float16, np.floating)):
+        return np.float16(-float(val))
+    return -float(val)
+
+
 @register("arith.extf")
 def arith__extf(op, context, env):
     return ArithOps.extf(context.get_value(op.operands[0]))
@@ -242,6 +253,30 @@ def arith__sitofp(op, context, env):
         context.get_value(op.operands[0]), np.float16,
         expect_floating=False, op_name="sitofp",
     )
+
+
+@register("arith.fptosi")
+def arith__fptosi(op, context, env):
+    dst_type = op.attributes.get("dst_type", "i32")
+    np_dtype = to_np_dtype(dst_type).type
+    return arith_cast(
+        context.get_value(op.operands[0]), np_dtype,
+        expect_floating=True, op_name="fptosi",
+    )
+
+
+@register("arith.trunci")
+def arith__trunci(op, context, env):
+    val = context.get_value(op.operands[0])
+    dst_type = op.attributes.get("dst_type", "i32")
+    np_dtype = to_np_dtype(dst_type)
+    if isinstance(val, Tile):
+        return Tile(val.data.astype(np_dtype), dst_type, val.shape)
+    # Scalar — truncate to the low N bits and reinterpret as signed, matching
+    # MLIR two's-complement semantics.  np.frombuffer handles the sign extension.
+    nbytes = np_dtype.itemsize
+    masked = int(val) & ((1 << (nbytes * 8)) - 1)
+    return int(np.frombuffer(masked.to_bytes(nbytes, "little"), dtype=np_dtype)[0])
 
 
 @register("arith.cmpi", latency_category=LC.COMPUTE_FLOAT)
@@ -516,6 +551,46 @@ def parse_arith_sitofp(op_text, parse_ctx):
         operands=[operand],
         attributes={},
         result_type=result_type
+    )
+
+
+@register_parser("arith.fptosi")
+def parse_arith_fptosi(op_text, parse_ctx):
+    result_match = re.match(r'(%\w+)\s*=\s*arith\.fptosi\s+(%\w+)', op_text)
+    if not result_match:
+        return None
+    result_name = result_match.group(1)
+    operand = result_match.group(2)
+    result_type = "i32"
+    to_match = re.search(r'to\s+(i\d+)', op_text)
+    if to_match:
+        result_type = to_match.group(1)
+    return Operation(
+        result=result_name,
+        op_type="arith.fptosi",
+        operands=[operand],
+        attributes={"dst_type": result_type},
+        result_type=result_type,
+    )
+
+
+@register_parser("arith.trunci")
+def parse_arith_trunci(op_text, parse_ctx):
+    result_match = re.match(r'(%\w+)\s*=\s*arith\.trunci\s+(%\w+)', op_text)
+    if not result_match:
+        return None
+    result_name = result_match.group(1)
+    operand = result_match.group(2)
+    dst_type = "i32"
+    to_match = re.search(r'to\s+(i\d+)', op_text)
+    if to_match:
+        dst_type = to_match.group(1)
+    return Operation(
+        result=result_name,
+        op_type="arith.trunci",
+        operands=[operand],
+        attributes={"dst_type": dst_type},
+        result_type=dst_type,
     )
 
 

@@ -57,9 +57,9 @@ module {
         %Ntkv_Ptkv = arith.divui %Ntkv, %Ptkv : index
 
         // In this example, all tensors Index, X, Y are in single memory space (e.g. DDR)
-        %X_start_address = arith.constant 30000000 : index
-        %Idx_start_address = arith.constant 20000000 : index
-        %Y_start_address = arith.constant 10000000 : index
+        %X_start_address = arith.constant 15000000 : index    // byte 30000000 / 2 (f16) = 15000000
+        %Idx_start_address = arith.constant 5000000 : index   // byte 20000000 / 4 (i32) = 5000000
+        %Y_start_address = arith.constant 5000000 : index     // byte 10000000 / 2 (f16) = 5000000
 
         // Accessing a tensor in KTIR follows a 3 step process:
         // Note1: Accesses are single-ended i.e., 

@@ -14,6 +14,20 @@
 | 1 | `ktdp.construct_distributed_memory_view` | ❌ | No handler, no parser. Key primitive for composing multiple per-partition memory views into a single distributed logical view. Critical for modeling distributed scratchpads. |
 | 2 | `ktdp.construct_indirect_access_tile` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; tests passing in `tests/test_indirect_access.py`. |
 
+### Pointer addressing convention
+
+`ktdp.construct_memory_view` treats its pointer operand as an **element
+offset** relative to the memref's element type. The interpreter
+converts to a byte address once, at the op boundary; `TileRef.base_ptr`
+and all downstream consumers (`construct_access_tile`, `ktdp.load`,
+`ktdp.store`, `ktdp.construct_indirect_access_tile`) remain
+byte-addressed internally. This matches the convention emitted by the
+`ktir-sdsc-translator`.
+
+The RFC does not explicitly specify byte vs. element addressing for
+memref pointer operands; we pin it to elements here. Mixed-dtype layouts
+can overlap only if element offsets land on byte-compatible addresses.
+
 ## B. `ktdp` Types & Attributes
 
 | # | Spec Item | Status | Notes |
@@ -56,17 +70,18 @@ dialects.
 
 ### Arith dialect
 
-The spec references the [full Arith dialect](https://mlir.llvm.org/docs/Dialects/ArithOps/). Currently implemented: `addf`, `subf`, `mulf`, `divf`, `addi`, `subi`, `muli`, `divui`, `remui`, `constant`, `maxf`, `maxnumf`, `extf`, `truncf`, `index_cast`, `sitofp`, `cmpi`, `select`.
+The spec references the [full Arith dialect](https://mlir.llvm.org/docs/Dialects/ArithOps/). Currently implemented: `addf`, `subf`, `mulf`, `divf`, `addi`, `subi`, `muli`, `divui`, `remui`, `constant`, `maxf`, `maxnumf`, `extf`, `truncf`, `trunci`, `index_cast`, `sitofp`, `fptosi`, `negf`, `cmpi`, `select`.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
 | 13 | `arith.cmpf` | ❌ | float compare — only `arith.cmpi` (int compare) exists |
-| 14 | `arith.negf` | ❌ | |
+| 14 | `arith.negf` | ✅ | Handler in `ktir_cpu/dialects/arith_ops.py`. |
 | 15 | `arith.absf` | ❌ | |
 | 16 | `arith.minf` | ❌ | only `maxf` / `maxnumf` exist |
 | 17 | `arith.minnumf` | ❌ | |
-| 18 | `arith.fptosi`, `arith.fptoui`, `arith.uitofp` | 🟡 | only `sitofp` exists |
+| 18 | `arith.fptosi`, `arith.fptoui`, `arith.uitofp` | 🟡 | `sitofp` and `fptosi` implemented; `fptoui` / `uitofp` remain. |
 | 19 | `arith.divsi`, `arith.remsi`, `arith.andi`, `arith.ori`, `arith.xori`, `arith.ceildivsi`, `arith.floordivsi` | ❌ | only unsigned variants `divui`/`remui` exist |
+| 19b | `arith.trunci` | ✅ | Integer narrowing cast (e.g., i64→i32) with two's-complement truncation; handler and parser in `ktir_cpu/dialects/arith_ops.py`. |
 
 ### Math dialect
 
@@ -82,22 +97,24 @@ The spec references the [full Math dialect](https://mlir.llvm.org/docs/Dialects/
 
 ### Linalg dialect
 
-The spec references the [full Linalg dialect](https://mlir.llvm.org/docs/Dialects/Linalg/). Currently implemented: `linalg.reduce`, `linalg.matmul`, `linalg.generic`, `linalg.broadcast`, `linalg.transpose`.
+The spec references the [full Linalg dialect](https://mlir.llvm.org/docs/Dialects/Linalg/). Currently implemented: `linalg.reduce`, `linalg.matmul`, `linalg.batch_matmul`, `linalg.generic`, `linalg.broadcast`, `linalg.transpose`, `linalg.fill`, `linalg.add`, `linalg.sub`, `linalg.mul`, `linalg.div`, `linalg.max`, `linalg.negf`, `linalg.abs`, `linalg.exp`, `linalg.log`, `linalg.index`, `linalg.yield`.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
-| 25 | `linalg.add` | ❌ | Used in the spec's primary matrix-add example — won't execute today |
+| 25 | `linalg.add` | ✅ | Handler in `ktir_cpu/dialects/linalg_ops.py`; also covers the spec's primary matrix-add example. |
 | 26 | `linalg.generic` | ✅ | Full `bb0` block handling in `ktir_cpu/dialects/linalg_ops.py` |
 | 27 | `linalg.map`, `linalg.broadcast`, `linalg.transpose` | 🟡 | `broadcast` and `transpose` implemented; `map` still missing |
+| 27b | Named elementwise ops (`sub`, `mul`, `div`, `max`, `negf`, `abs`, `exp`, `log`) | ✅ | Shared handler path in `ktir_cpu/dialects/linalg_ops.py`; `ins`/`outs` form. Outs provides shape/dtype only — does not accumulate. |
+| 27c | `linalg.batch_matmul` | ✅ | 3D matmul with accumulation into outs, mirroring `linalg.matmul` convention. |
 
 ### Tensor dialect
 
-Currently implemented: `tensor.splat`, `tensor.extract`, `tensor.expand_shape`, `tensor.collapse_shape`.
+Currently implemented: `tensor.collapse_shape`, `tensor.empty`, `tensor.expand_shape`, `tensor.extract`, `tensor.extract_slice`, `tensor.generate`, `tensor.insert_slice`, `tensor.splat`, `tensor.yield`.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
-| 28 | `tensor.extract_slice` | ❌ | Spec explicitly calls this out for tensor-level slicing |
-| 29 | `tensor.insert_slice`, `tensor.collapse_shape` | 🟡 | `collapse_shape` implemented; `insert_slice` still missing |
+| 28 | `tensor.extract_slice` | ✅ | Static offsets/sizes/strides only; strides must be 1; rank-preserving and rank-reducing forms both supported. Handler + parser in `ktir_cpu/dialects/tensor_ops.py`. |
+| 29 | `tensor.insert_slice`, `tensor.collapse_shape` | ✅ | Both implemented. `insert_slice` matches the extract_slice scope (static lists, strides=1, rank reduction supported); `collapse_shape` reshapes row-major buffers to the declared result type. |
 
 ### MemRef dialect
 
@@ -141,14 +158,15 @@ Limits dialect coverage for real-world kernels:
 - **#9–12**: ❌ SCF parallel/reduce operations
 - **#13–19**: ❌/🟡 Many standard arith ops (cmpf, negf, absf, minf, signed int ops)
 - **#20–24**: ✅ All math ops now implemented (log2, log1p, tanh, sin, cos, rsqrt, absf, ceil, floor, erf, powf, fma)
-- **#28, #30–31**: ❌ `tensor.extract_slice`, entire `memref` dialect
+- **#28, #29**: ✅ `tensor.extract_slice` and `tensor.insert_slice` now implemented
+- **#30–31**: ❌ entire `memref` dialect
 - **#32**: 🟡 Dynamic sizes/strides not supported
 
 ### Lower Priority
 Extensibility and completeness:
 
 - **#3, #4**: ❌/🟡 Dynamic access tile dimensions, generic `MemorySpaceAttr`
-- **#27, #29**: 🟡 Remaining linalg/tensor ops (`linalg.map`, `tensor.insert_slice`)
+- **#27**: 🟡 Remaining linalg op (`linalg.map` still missing)
 - **#36, #39**: 🟡 Module-level handling, full function signatures
 
 ### Resolved
@@ -156,6 +174,8 @@ Extensibility and completeness:
 - **#6, #7, #8**: ✅ `access_tile_set`, `access_tile_order`, `base_map`
 - **#20–24**: ✅ All math ops (rsqrt, log2, log1p, tanh, sin, cos, absf, ceil, floor, erf, powf, fma)
 - **#26**: ✅ `linalg.generic`
+- **#28**: ✅ `tensor.extract_slice`
+- **#29**: ✅ `tensor.insert_slice` and `tensor.collapse_shape`
 - **#33, #34, #35**: ✅ Access tile coordinate semantics
 - **#37, #38**: ✅ Affine expression evaluation and alias support
 
@@ -205,7 +225,7 @@ Goal: support the rest of the ops the RFC explicitly calls out.
 
 - Add `linalg.add` so the RFC's canonical matrix-add example can execute
   without translation.
-- Add `tensor.extract_slice`.
+- ✅ Add `tensor.extract_slice` and `tensor.insert_slice`.
 - Add `memref.subview` and the minimal `memref` dialect support required to
   interpret it.
 - Add the missing SCF ops explicitly named by the RFC:
@@ -295,7 +315,7 @@ If we want the fastest path to meaningful conformance progress:
 2. ✅ Rework `ktdp.load` / `ktdp.store` around that representation.
 3. ✅ Add `construct_indirect_access_tile`.
 4. ❌ Add `construct_distributed_memory_view`.
-5. ❌ Add `linalg.add`, `tensor.extract_slice`, and `memref.subview`.
+5. 🟡 Add `linalg.add`, `tensor.extract_slice` (✅), and `memref.subview`.
 6. ❌ Fill in the missing RFC-listed SCF ops.
 7. ❌ Expand broader Arith/Math/Linalg coverage as compiler demand appears.
 

@@ -72,10 +72,10 @@ SMALL_INDIRECT_MLIR = """
 
 module {
   func.func @small_indirect_gather() attributes {grid = [1, 1]} {
-    %X_addr    = arith.constant 0 : index
-    %IDX1_addr = arith.constant 64 : index
-    %IDX2_addr = arith.constant 128 : index
-    %Y_addr    = arith.constant 192 : index
+    %X_addr    = arith.constant 0 : index     // byte 0   / 2 (f16) = 0
+    %IDX1_addr = arith.constant 16 : index    // byte 64  / 4 (i32) = 16
+    %IDX2_addr = arith.constant 32 : index    // byte 128 / 4 (i32) = 32
+    %Y_addr    = arith.constant 96 : index    // byte 192 / 2 (f16) = 96
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
@@ -167,8 +167,8 @@ def test_small_indirect_gather():
 _SSA_NONZERO_RANGE_MLIR = """
 module {
   func.func @bad_indirect() attributes {grid = [1, 1]} {
-    %X_addr   = arith.constant 0   : index
-    %IDX_addr = arith.constant 64  : index
+    %X_addr   = arith.constant 0   : index     // byte 0  / 2 (f16) = 0
+    %IDX_addr = arith.constant 16  : index     // byte 64 / 4 (i32) = 16
     %c2       = arith.constant 2   : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
@@ -199,8 +199,8 @@ module {
 _SSA_ZERO_RANGE_MLIR = """
 module {
   func.func @ok_indirect() attributes {grid = [1, 1]} {
-    %X_addr   = arith.constant 0   : index
-    %IDX_addr = arith.constant 64  : index
+    %X_addr   = arith.constant 0   : index     // byte 0  / 2 (f16) = 0
+    %IDX_addr = arith.constant 16  : index     // byte 64 / 4 (i32) = 16
     %c2       = arith.constant 2   : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {

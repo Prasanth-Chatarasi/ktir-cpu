@@ -6,9 +6,9 @@ module {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %tile_size = arith.constant 3 : index
-    %A_start_address = arith.constant 1024 : index
-    %B_start_address = arith.constant 12288 : index
-    %C_start_address = arith.constant 18432 : index
+    %A_start_address = arith.constant 512 : index    // byte 1024 / 2 (f16) = 512
+    %B_start_address = arith.constant 6144 : index   // byte 12288 / 2 (f16) = 6144
+    %C_start_address = arith.constant 9216 : index   // byte 18432 / 2 (f16) = 9216
 
     %id = ktdp.get_compute_tile_id : index
     %start_row = arith.muli %id, %tile_size : index

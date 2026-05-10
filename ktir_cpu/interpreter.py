@@ -138,17 +138,30 @@ class KTIRInterpreter:
             if len(kwargs) == len(declared):
                 kwargs = dict(zip(declared, kwargs.values()))
 
-        # Allocate input tensors in HBM
-        input_ptrs = {}
+        # Allocate input tensors in HBM. The kernel receives an ELEMENT
+        # pointer; construct_memory_view multiplies by the memref's
+        # element size to recover the byte address.  The allocator's
+        # stick-aligned (128-byte) return values are divisible by every
+        # currently supported itemsize.
+        input_ptrs = {}             # element-addressed (what the kernel sees)
+        input_byte_ptrs = {}        # byte-addressed (for output read-back)
         input_dtypes = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                ptr = self.memory.hbm.allocate(tensor.nbytes)
-                self.memory.hbm.write(ptr, tensor)
-                input_ptrs[arg_name] = ptr
+                byte_ptr = self.memory.hbm.allocate(tensor.nbytes)
+                self.memory.hbm.write(byte_ptr, tensor)
+                itemsize = tensor.itemsize
+                if byte_ptr % itemsize != 0:
+                    raise RuntimeError(
+                        f"HBM allocator returned byte_ptr={byte_ptr} not aligned "
+                        f"to itemsize={itemsize} for arg {arg_name!r}"
+                    )
+                element_ptr = byte_ptr // itemsize
+                input_ptrs[arg_name] = element_ptr
+                input_byte_ptrs[arg_name] = byte_ptr
                 input_dtypes[arg_name] = _ktir_dtype(tensor.dtype)
             else:
-                # Scalar argument (like n)
+                # Scalar argument (like n): pass through as-is.
                 input_ptrs[arg_name] = tensor
 
         # Execute on all cores
@@ -168,13 +181,15 @@ class KTIRInterpreter:
             max_rounds=10
         )
 
-        # Read output tensors from HBM
+        # Read output tensors from HBM. Read-back uses byte addresses
+        # because HBMSimulator.read is byte-indexed; input_ptrs holds
+        # element addresses the kernel sees.
         outputs = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                ptr = input_ptrs[arg_name]
+                byte_ptr = input_byte_ptrs[arg_name]
                 n_elements = math.prod(tensor.shape)
-                output_data = self.memory.hbm.read(ptr, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
+                output_data = self.memory.hbm.read(byte_ptr, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
                 outputs[arg_name] = output_data
 
         return outputs

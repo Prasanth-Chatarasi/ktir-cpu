@@ -80,6 +80,11 @@ def _tile(values, dtype="f16"):
     return Tile(data, dtype, data.shape)
 
 
+def _tile_shape(values, shape, dtype="f16"):
+    data = np.array(values, dtype=np.float16).reshape(shape)
+    return Tile(data, dtype, shape)
+
+
 def _ctx_with(**bindings):
     ctx = _make_ctx()
     for k, v in bindings.items():
@@ -195,6 +200,16 @@ class TestArithFloat:
         t = _tile([1, 2])
         ctx = _ctx_with(**{"%a": t})
         assert _call("arith.truncf", ctx, _make_env(), operands=["%a"]) is t
+
+    def test_negf_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([1, -2, 3])})
+        result = _call("arith.negf", ctx, _make_env(), operands=["%a"])
+        assert np.array_equal(result.data, np.array([-1, 2, -3], dtype=np.float16))
+
+    def test_negf_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(2.5)})
+        result = _call("arith.negf", ctx, _make_env(), operands=["%a"])
+        assert float(result) == pytest.approx(-2.5, rel=1e-3)
 
 # ---------------------------------------------------------------------------
 # arith (int) dialect exec
@@ -395,6 +410,58 @@ class TestArithCmpf:
         result_uno = _call("arith.cmpf", ctx, _make_env(),
                            operands=["%a", "%b"], attributes={"predicate": "uno"})
         assert np.array_equal(result_uno.data, np.array([True, False]))
+
+
+
+class TestArithFptosi:
+    def test_fptosi_tile(self):
+        # 1.5, 2.7, -3.9 -> truncation toward zero -> 1, 2, -3
+        data = np.array([1.5, 2.7, -3.9], dtype=np.float16)
+        ctx = _ctx_with(**{"%a": Tile(data, "f16", (3,))})
+        result = _call("arith.fptosi", ctx, _make_env(), operands=["%a"])
+        assert result.data.dtype == np.int32
+        assert np.array_equal(result.data, np.array([1, 2, -3], dtype=np.int32))
+
+    def test_fptosi_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(5.7)})
+        result = _call("arith.fptosi", ctx, _make_env(), operands=["%a"])
+        assert int(result) == 5
+
+    def test_fptosi_tile_to_i64(self):
+        # dst_type="i64" must produce an int64 Tile — handler must honor the
+        # parsed destination type, not hardcode i32.
+        data = np.array([1.5, 2.7, -3.9], dtype=np.float16)
+        ctx = _ctx_with(**{"%a": Tile(data, "f16", (3,))})
+        result = _call(
+            "arith.fptosi", ctx, _make_env(),
+            operands=["%a"], attributes={"dst_type": "i64"},
+        )
+        assert result.data.dtype == np.int64
+        assert np.array_equal(result.data, np.array([1, 2, -3], dtype=np.int64))
+
+
+class TestArithTrunci:
+    def test_trunci_tile_i64_to_i32(self):
+        data = np.array([1, 2, 1 << 33, -5], dtype=np.int64)
+        ctx = _ctx_with(**{"%a": Tile(data, "i64", (4,))})
+        result = _call(
+            "arith.trunci", ctx, _make_env(),
+            operands=["%a"], attributes={"dst_type": "i32"},
+        )
+        assert result.data.dtype == np.int32
+        # low 32 bits: 1<<33 truncates to 0
+        assert int(result.data[0]) == 1
+        assert int(result.data[1]) == 2
+        assert int(result.data[2]) == 0
+        assert int(result.data[3]) == -5
+
+    def test_trunci_scalar(self):
+        ctx = _ctx_with(**{"%a": int((1 << 33) | 7)})
+        result = _call(
+            "arith.trunci", ctx, _make_env(),
+            operands=["%a"], attributes={"dst_type": "i32"},
+        )
+        assert int(result) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -860,17 +927,21 @@ class TestKtdp:
                      result=["%x", "%y"]) == (2, 1)
 
     def test_construct_memory_view(self):
-        # creates a TileRef pointing at the given pointer with the given shape
+        # Allocates HBM; passes an ELEMENT pointer (byte_ptr // itemsize)
+        # to construct_memory_view; the handler multiplies back to produce
+        # the same byte-addressed TileRef.base_ptr.
         hbm = HBMSimulator()
-        ptr = hbm.allocate(256 * 2)
+        byte_ptr = hbm.allocate(256 * 2)
+        assert byte_ptr % 2 == 0, "allocator should return even-aligned address for f16"
+        element_ptr = byte_ptr // 2
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
-        ctx.set_value("%ptr", ptr)
+        ctx.set_value("%ptr", element_ptr)
         result = _call("ktdp.construct_memory_view", ctx, _make_env(),
                        operands=["%ptr"],
                        attributes={"shape": (256,), "strides": [1],
                                    "memory_space": "HBM", "dtype": "f16"})
-        assert result.base_ptr == ptr
+        assert result.base_ptr == byte_ptr
         assert result.shape == (256,)
 
     def test_load_store_roundtrip(self):
@@ -904,3 +975,346 @@ class TestKtdp:
         ctx.set_value("%acc2", access_tile)
         _call("ktdp.store", ctx, env, operands=["%tile", "%acc2"])
         assert np.array_equal(hbm.read(ptr, 8, "f16"), data * 2)
+
+
+# ---------------------------------------------------------------------------
+# linalg named elementwise binary ops
+# ---------------------------------------------------------------------------
+
+class TestLinalgNamedBinary:
+    def _run(self, op_type):
+        a = _tile_shape([1, 2, 3, 4], (2, 2))
+        b = _tile_shape([5, 6, 7, 8], (2, 2))
+        out = _tile_shape([0, 0, 0, 0], (2, 2))
+        ctx = _ctx_with(**{"%a": a, "%b": b, "%c": out})
+        return _call(
+            op_type, ctx, _make_env(),
+            operands=["%a", "%b", "%c"],
+        )
+
+    def test_add(self):
+        result = self._run("linalg.add")
+        assert np.array_equal(result.data, np.array([[6, 8], [10, 12]], dtype=np.float16))
+
+    def test_sub(self):
+        result = self._run("linalg.sub")
+        assert np.array_equal(result.data, np.array([[-4, -4], [-4, -4]], dtype=np.float16))
+
+    def test_mul(self):
+        result = self._run("linalg.mul")
+        assert np.array_equal(result.data, np.array([[5, 12], [21, 32]], dtype=np.float16))
+
+    def test_div(self):
+        result = self._run("linalg.div")
+        expected = np.array([[1/5, 2/6], [3/7, 4/8]], dtype=np.float16)
+        assert np.allclose(result.data, expected, rtol=1e-2)
+
+    def test_max(self):
+        a = _tile_shape([1, 9, 3, 4], (2, 2))
+        b = _tile_shape([5, 2, 7, 1], (2, 2))
+        out = _tile_shape([0, 0, 0, 0], (2, 2))
+        ctx = _ctx_with(**{"%a": a, "%b": b, "%c": out})
+        result = _call(
+            "linalg.max", ctx, _make_env(),
+            operands=["%a", "%b", "%c"],
+        )
+        assert np.array_equal(result.data, np.array([[5, 9], [7, 4]], dtype=np.float16))
+
+    def test_outs_does_not_accumulate(self):
+        # Named elementwise ops do NOT accumulate into outs; outs provides
+        # shape/dtype only.
+        a = _tile_shape([1, 2, 3, 4], (2, 2))
+        b = _tile_shape([0, 0, 0, 0], (2, 2))
+        out = _tile_shape([100, 100, 100, 100], (2, 2))  # should be ignored as a value
+        ctx = _ctx_with(**{"%a": a, "%b": b, "%c": out})
+        result = _call(
+            "linalg.add", ctx, _make_env(),
+            operands=["%a", "%b", "%c"],
+        )
+        assert np.array_equal(result.data, a.data)
+
+
+class TestLinalgNamedUnary:
+    def _run(self, op_type, in_vals, out_vals=(0, 0, 0, 0)):
+        a = _tile_shape(in_vals, (2, 2))
+        out = _tile_shape(out_vals, (2, 2))
+        ctx = _ctx_with(**{"%a": a, "%c": out})
+        return _call(
+            op_type, ctx, _make_env(),
+            operands=["%a", "%c"],
+        )
+
+    def test_negf(self):
+        result = self._run("linalg.negf", [1, -2, 3, -4])
+        assert np.array_equal(result.data, np.array([[-1, 2], [-3, 4]], dtype=np.float16))
+
+    def test_abs(self):
+        result = self._run("linalg.abs", [1, -2, 3, -4])
+        assert np.array_equal(result.data, np.array([[1, 2], [3, 4]], dtype=np.float16))
+
+    def test_exp(self):
+        result = self._run("linalg.exp", [0, 1, 2, 3])
+        expected = np.exp(np.array([[0, 1], [2, 3]], dtype=np.float16))
+        assert np.allclose(result.data, expected, rtol=1e-2)
+
+    def test_log(self):
+        result = self._run("linalg.log", [1, 2, 4, 8])
+        expected = np.log(np.array([[1, 2], [4, 8]], dtype=np.float16))
+        assert np.allclose(result.data, expected, rtol=1e-2)
+
+
+class TestLinalgBatchMatmul:
+    def test_batch_matmul_zero_accumulator(self):
+        # Shape: A (B=2, M=2, K=3), B (B=2, K=3, N=2), C (B=2, M=2, N=2)
+        a_data = np.arange(12, dtype=np.float16).reshape(2, 2, 3)
+        b_data = np.arange(12, dtype=np.float16).reshape(2, 3, 2)
+        c_data = np.zeros((2, 2, 2), dtype=np.float16)
+        ctx = _ctx_with(**{
+            "%a": Tile(a_data, "f16", (2, 2, 3)),
+            "%b": Tile(b_data, "f16", (2, 3, 2)),
+            "%c": Tile(c_data, "f16", (2, 2, 2)),
+        })
+        result = _call(
+            "linalg.batch_matmul", ctx, _make_env(),
+            operands=["%a", "%b", "%c"],
+        )
+        expected = np.einsum("bmk,bkn->bmn", a_data.astype(np.float32),
+                             b_data.astype(np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, rtol=1e-2)
+
+    def test_batch_matmul_accumulates_into_outs(self):
+        a_data = np.ones((1, 2, 2), dtype=np.float16)
+        b_data = np.ones((1, 2, 2), dtype=np.float16)
+        c_data = np.full((1, 2, 2), 10.0, dtype=np.float16)
+        ctx = _ctx_with(**{
+            "%a": Tile(a_data, "f16", (1, 2, 2)),
+            "%b": Tile(b_data, "f16", (1, 2, 2)),
+            "%c": Tile(c_data, "f16", (1, 2, 2)),
+        })
+        result = _call(
+            "linalg.batch_matmul", ctx, _make_env(),
+            operands=["%a", "%b", "%c"],
+        )
+        # A@B = [[2,2],[2,2]]; + C = [[12,12],[12,12]]
+        assert np.array_equal(result.data, np.full((1, 2, 2), 12.0, dtype=np.float16))
+
+
+# ---------------------------------------------------------------------------
+# ktdp.construct_memory_view element-addressing semantics
+# ---------------------------------------------------------------------------
+
+class TestConstructMemoryViewElementAddressing:
+    """The pointer operand to construct_memory_view is an ELEMENT offset.
+
+    The handler multiplies by bytes_per_elem(dtype) once, at the boundary.
+    TileRef.base_ptr remains byte-addressed internally.
+    """
+
+    def test_element_ptr_for_f16_scales_by_2(self):
+        # Element ptr = 5, dtype = f16 -> byte_ptr should be 10.
+        ctx = _ctx_with(**{"%p": 5})
+        op = _op(
+            "ktdp.construct_memory_view",
+            operands=["%p"],
+            attributes={
+                "shape": (4,),
+                "strides": [1],
+                "memory_space": "HBM",
+                "dtype": "f16",
+            },
+        )
+        ref = dispatch("ktdp.construct_memory_view")(op, ctx, _make_env())
+        assert ref.base_ptr == 10
+
+    def test_element_ptr_for_f32_scales_by_4(self):
+        # Element ptr = 5, dtype = f32 -> byte_ptr should be 20.
+        ctx = _ctx_with(**{"%p": 5})
+        op = _op(
+            "ktdp.construct_memory_view",
+            operands=["%p"],
+            attributes={
+                "shape": (4,),
+                "strides": [1],
+                "memory_space": "HBM",
+                "dtype": "f32",
+            },
+        )
+        ref = dispatch("ktdp.construct_memory_view")(op, ctx, _make_env())
+        assert ref.base_ptr == 20
+
+    def test_zero_ptr_stays_zero(self):
+        # Element ptr = 0 -> byte_ptr = 0 regardless of dtype.
+        ctx = _ctx_with(**{"%p": 0})
+        op = _op(
+            "ktdp.construct_memory_view",
+            operands=["%p"],
+            attributes={
+                "shape": (4,),
+                "strides": [1],
+                "memory_space": "HBM",
+                "dtype": "f32",
+            },
+        )
+        ref = dispatch("ktdp.construct_memory_view")(op, ctx, _make_env())
+        assert ref.base_ptr == 0
+
+
+# ---------------------------------------------------------------------------
+# tensor.extract_slice / tensor.insert_slice
+# ---------------------------------------------------------------------------
+
+class TestTensorSliceOps:
+    """Static-offsets/sizes/strides slice ops. Strides must be 1; rank
+    reduction supported."""
+
+    # --- extract_slice ---
+
+    def test_extract_slice_rank_preserving_2d(self):
+        # 4x4 input, slice [1:3, 0:2] -> 2x2.
+        src = Tile(np.arange(16, dtype=np.float16).reshape(4, 4), "f16", (4, 4))
+        ctx = _ctx_with(**{"%a": src})
+        op = _op(
+            "tensor.extract_slice",
+            operands=["%a"],
+            attributes={
+                "offsets": [1, 0],
+                "sizes": [2, 2],
+                "strides": [1, 1],
+                "input_shape": (4, 4),
+                "result_shape": (2, 2),
+                "dtype": "f16",
+            },
+        )
+        ref = dispatch("tensor.extract_slice")(op, ctx, _make_env())
+        assert ref.shape == (2, 2)
+        assert np.array_equal(
+            ref.data,
+            np.array([[4, 5], [8, 9]], dtype=np.float16),
+        )
+
+    def test_extract_slice_rank_reducing(self):
+        # 12x1x64x64 input; slice sizes [12, 1, 64, 1] with result shape
+        # (12, 1, 64) — the Softmax_106-Mul case. The size-1 last dim is
+        # squeezed.
+        src_data = np.arange(12 * 1 * 64 * 64, dtype=np.float16).reshape(12, 1, 64, 64)
+        src = Tile(src_data, "f16", (12, 1, 64, 64))
+        ctx = _ctx_with(**{"%a": src})
+        op = _op(
+            "tensor.extract_slice",
+            operands=["%a"],
+            attributes={
+                "offsets": [0, 0, 0, 0],
+                "sizes": [12, 1, 64, 1],
+                "strides": [1, 1, 1, 1],
+                "input_shape": (12, 1, 64, 64),
+                "result_shape": (12, 1, 64),
+                "dtype": "f16",
+            },
+        )
+        ref = dispatch("tensor.extract_slice")(op, ctx, _make_env())
+        assert ref.shape == (12, 1, 64)
+        # src[:, :, :, 0:1] squeezed on last axis equals src[:, :, :, 0].
+        assert np.array_equal(ref.data, src_data[:, :, :, 0])
+
+    def test_extract_slice_strides_nonone_raises(self):
+        src = Tile(np.arange(16, dtype=np.float16).reshape(4, 4), "f16", (4, 4))
+        ctx = _ctx_with(**{"%a": src})
+        op = _op(
+            "tensor.extract_slice",
+            operands=["%a"],
+            attributes={
+                "offsets": [0, 0],
+                "sizes": [2, 2],
+                "strides": [1, 2],  # stride 2 not supported
+                "input_shape": (4, 4),
+                "result_shape": (2, 2),
+                "dtype": "f16",
+            },
+        )
+        with pytest.raises(NotImplementedError, match="strides"):
+            dispatch("tensor.extract_slice")(op, ctx, _make_env())
+
+    # --- insert_slice ---
+
+    def test_insert_slice_overwrites_region(self):
+        # 4x4 dest; insert a 2x3 source at offsets [1, 0].
+        dest_data = np.zeros((4, 4), dtype=np.float16)
+        src_data = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float16)
+        dest = Tile(dest_data, "f16", (4, 4))
+        src = Tile(src_data, "f16", (2, 3))
+        ctx = _ctx_with(**{"%s": src, "%d": dest})
+        op = _op(
+            "tensor.insert_slice",
+            operands=["%s", "%d"],
+            attributes={
+                "offsets": [1, 0],
+                "sizes": [2, 3],
+                "strides": [1, 1],
+                "source_shape": (2, 3),
+                "dest_shape": (4, 4),
+                "dtype": "f16",
+            },
+        )
+        ref = dispatch("tensor.insert_slice")(op, ctx, _make_env())
+        expected = np.zeros((4, 4), dtype=np.float16)
+        expected[1:3, 0:3] = src_data
+        assert np.array_equal(ref.data, expected)
+
+    def test_insert_slice_rank_reducing(self):
+        # Rank-3 source into rank-4 dest; one size-1 dim in the sizes list.
+        dest_data = np.zeros((12, 1, 64, 64), dtype=np.float16)
+        src_data = np.arange(12 * 1 * 64, dtype=np.float16).reshape(12, 1, 64)
+        dest = Tile(dest_data, "f16", (12, 1, 64, 64))
+        src = Tile(src_data, "f16", (12, 1, 64))
+        ctx = _ctx_with(**{"%s": src, "%d": dest})
+        op = _op(
+            "tensor.insert_slice",
+            operands=["%s", "%d"],
+            attributes={
+                "offsets": [0, 0, 0, 0],
+                "sizes": [12, 1, 64, 1],
+                "strides": [1, 1, 1, 1],
+                "source_shape": (12, 1, 64),
+                "dest_shape": (12, 1, 64, 64),
+                "dtype": "f16",
+            },
+        )
+        ref = dispatch("tensor.insert_slice")(op, ctx, _make_env())
+        expected = np.zeros((12, 1, 64, 64), dtype=np.float16)
+        expected[:, :, :, 0:1] = src_data.reshape(12, 1, 64, 1)
+        assert np.array_equal(ref.data, expected)
+
+    def test_insert_slice_does_not_mutate_dest(self):
+        # The op must be functional: the input dest Tile's data array
+        # should be untouched after the op.
+        dest_data = np.zeros((4, 4), dtype=np.float16)
+        src_data = np.ones((2, 3), dtype=np.float16)
+        dest = Tile(dest_data, "f16", (4, 4))
+        src = Tile(src_data, "f16", (2, 3))
+        ctx = _ctx_with(**{"%s": src, "%d": dest})
+        op = _op(
+            "tensor.insert_slice",
+            operands=["%s", "%d"],
+            attributes={
+                "offsets": [1, 0], "sizes": [2, 3], "strides": [1, 1],
+                "source_shape": (2, 3), "dest_shape": (4, 4), "dtype": "f16",
+            },
+        )
+        _ = dispatch("tensor.insert_slice")(op, ctx, _make_env())
+        # dest_data must still be all zeros; the op returned a new copy.
+        assert np.array_equal(dest_data, np.zeros((4, 4), dtype=np.float16))
+
+    def test_insert_slice_strides_nonone_raises(self):
+        dest = Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+        src = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        ctx = _ctx_with(**{"%s": src, "%d": dest})
+        op = _op(
+            "tensor.insert_slice",
+            operands=["%s", "%d"],
+            attributes={
+                "offsets": [0, 0], "sizes": [2, 2], "strides": [1, 2],
+                "source_shape": (2, 2), "dest_shape": (4, 4), "dtype": "f16",
+            },
+        )
+        with pytest.raises(NotImplementedError, match="strides"):
+            dispatch("tensor.insert_slice")(op, ctx, _make_env())
